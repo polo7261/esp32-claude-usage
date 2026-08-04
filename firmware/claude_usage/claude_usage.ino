@@ -6,19 +6,25 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <ESPmDNS.h>
 #include "esp_wifi.h"
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 
-// ── WiFi ──
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// ── 本機設定 ──
+// WiFi 憑證與 server 位址都在 secrets.h（未進版控）。
+// 第一次編譯前： cp secrets.h.example secrets.h  再填入自己的值。
+#include "secrets.h"
 
-// ── Server ──
-// 改成跑 server.py 那台電腦的區網 IP（下方 Diag 段的 IP 也要一起改）
-const char* SERVER_URL = "http://192.168.1.100:8266/usage";
+const IPAddress SERVER_FALLBACK_IP(SERVER_IP_OCTETS);
+IPAddress serverIp;  // resolved via mDNS, falls back to the static address
+String serverUrl;    // rebuilt whenever serverIp changes — single source
 const unsigned long FETCH_INTERVAL = 60000;
+// Reconnect backstop bounds. The floor is well clear of a WPA2 handshake plus
+// DHCP so a retry never lands on top of one still in flight.
+const unsigned long RECONNECT_BACKOFF_MIN = 15000;
+const unsigned long RECONNECT_BACKOFF_MAX = 120000;
 
 // ── LCD Pin Config (Waveshare ESP32-S3-LCD-1.47) ──
 class LGFX : public lgfx::LGFX_Device {
@@ -81,26 +87,73 @@ static const uint16_t COL_BLUE   = 0x3B7F;
 static const uint16_t COL_GREEN  = 0x2E8B;
 static const uint16_t COL_YELLOW = 0xFE60;
 static const uint16_t COL_RED    = 0xF800;
+static const uint16_t COL_CYAN   = 0x07FA;
+static const uint16_t COL_PURPLE = 0xA95F;
+static const uint16_t COL_ORANGE = 0xFCC0;
+static const uint16_t COL_MINT   = 0x2FEB;
+
+// Each model bar takes the next hue so two models never look alike.
+static const uint16_t MODEL_ACCENTS[] = { COL_PURPLE, COL_MINT, COL_CYAN, COL_GREEN };
+static const int MODEL_ACCENT_COUNT = sizeof(MODEL_ACCENTS) / sizeof(MODEL_ACCENTS[0]);
+
+static const int MAX_MODELS = 4;
+static const int BARS_PER_PAGE = 3;
+
+struct ModelUsage {
+  String name;
+  int pct;
+  String reset;
+};
+
+// Local transcript accounting (ccusage) — a different source from the plan
+// limits above. pct is this model's share of the week's tokens, and cost is a
+// list-price valuation, NOT what the subscription is billed.
+struct TokenUsage {
+  String name;
+  int pct;
+  String tok;
+  float cost;
+};
 
 unsigned long lastFetch = 0;
 unsigned long lastAnim = 0;
+unsigned long lastReconnect = 0;
+unsigned long reconnectBackoff = RECONNECT_BACKOFF_MIN;
 int sessionPct = -1;
 int weeklyPct = -1;
 int sessionResetMin = 0;
-int fablePct = -1;
-String fableLabel;
+ModelUsage models[MAX_MODELS];
+int modelCount = 0;
+TokenUsage tokModels[MAX_MODELS];
+int tokModelCount = 0;
+bool ccOk = false;
+String tokActive;
+String tokWeek;
+float burnHr = 0;
+bool demoModels = false;
+bool spendEnabled = false;
+int spendPct = -1;
+float spendUsed = 0;
+float spendLimit = 0;
+String spendCur;
 String weeklyResetDay;
 String apiStatus;
 bool hasData = false;
 bool fetchError = false;
+int curPage = 0;
 
-uint16_t barColor(int pct) {
-  if (pct < 50) return COL_BLUE;
-  if (pct < 75) return COL_YELLOW;
-  return COL_RED;
+// Per-metric accent in the normal range, shared warning colours above it —
+// so the hue tells you *which* limit and the shift tells you *how bad*.
+uint16_t barColor(int pct, uint16_t accent) {
+  if (pct >= 90) return COL_RED;
+  if (pct >= 75) return COL_YELLOW;
+  return accent;
 }
 
-void drawBar(int y, const char* label, int pct, const char* resetInfo) {
+// warn=false for bars whose percentage is a share, not a limit — a model at
+// 98% of this week's tokens is not a warning, so it keeps its own colour.
+void drawBar(int y, const char* label, int pct, uint16_t accent, const char* footer,
+             bool warn = true) {
   int barX = 16;
   int barW = 140;
   int barH = 14;
@@ -119,14 +172,26 @@ void drawBar(int y, const char* label, int pct, const char* resetInfo) {
   lcd.fillRoundRect(barX, barY, barW, barH, 4, COL_BAR_BG);
 
   int fillW = (barW * pct) / 100;
+  if (fillW > barW) fillW = barW;
   if (fillW > 0) {
-    lcd.fillRoundRect(barX, barY, fillW, barH, 4, barColor(pct));
+    lcd.fillRoundRect(barX, barY, fillW, barH, 4, warn ? barColor(pct, accent) : accent);
   }
 
   lcd.setTextColor(COL_TEXT, COL_BG);
   lcd.setFont(&fonts::Font0);
   lcd.setCursor(barX, barY + 20);
-  lcd.printf("Resets: %s", resetInfo);
+  lcd.print(footer);
+}
+
+// Page 0 is the plan limits, page 1 the token split when ccusage answered,
+// then one page per 3 API model buckets. Both middle sections can be absent.
+bool hasTokenPage() { return ccOk && tokModelCount > 0; }
+
+int pageCount() {
+  int n = 1;
+  if (hasTokenPage()) n += 1;
+  if (modelCount > 0) n += (modelCount + BARS_PER_PAGE - 1) / BARS_PER_PAGE;
+  return n;
 }
 
 void drawScreen() {
@@ -137,10 +202,14 @@ void drawScreen() {
   lcd.setCursor(16, 12);
   lcd.print("Claude");
 
-  lcd.setTextColor(COL_TEXT, COL_BG);
+  bool tokPage = hasTokenPage() && curPage == 1;
+  bool apiPage = curPage > 0 && !tokPage;
+
+  // Synthetic bars must never be mistakable for real usage — say so in the header
+  lcd.setTextColor(apiPage && demoModels ? COL_ORANGE : COL_TEXT, COL_BG);
   lcd.setFont(&fonts::Font2);
   lcd.setCursor(112, 18);
-  lcd.print("Usage");
+  lcd.print(curPage == 0 ? "Usage" : tokPage ? "Token" : (demoModels ? "DEMO" : "Model"));
 
   lcd.drawFastHLine(16, 42, 140, 0x3186);
 
@@ -152,21 +221,53 @@ void drawScreen() {
     return;
   }
 
-  char resetBuf[32];
-  if (sessionResetMin >= 60) {
-    snprintf(resetBuf, sizeof(resetBuf), "%dh %dm", sessionResetMin / 60, sessionResetMin % 60);
+  const int slotY[BARS_PER_PAGE] = { 54, 132, 210 };
+  char label[28];
+  char footer[32];
+
+  if (curPage == 0) {
+    int slot = 0;
+
+    if (sessionResetMin >= 60) {
+      snprintf(footer, sizeof(footer), "Resets: %dh %dm",
+               sessionResetMin / 60, sessionResetMin % 60);
+    } else {
+      snprintf(footer, sizeof(footer), "Resets: %dm", sessionResetMin);
+    }
+    drawBar(slotY[slot++], "Session (5h)", sessionPct, COL_BLUE, footer);
+
+    snprintf(footer, sizeof(footer), "Resets: %s", weeklyResetDay.c_str());
+    drawBar(slotY[slot++], "Weekly (7d)", weeklyPct, COL_CYAN, footer);
+
+    // No token counts exist in the usage API — credits are the only
+    // consumption figure it reports, so that is what this bar shows.
+    if (spendEnabled && slot < BARS_PER_PAGE) {
+      snprintf(footer, sizeof(footer), "%.2f / %.2f %s",
+               spendUsed, spendLimit, spendCur.c_str());
+      drawBar(slotY[slot++], "Credits", spendPct, COL_ORANGE, footer);
+    }
+  } else if (tokPage) {
+    // Headline numbers for the live 5h block, above the per-model split
+    lcd.setTextColor(COL_TEXT, COL_BG);
+    lcd.setFont(&fonts::Font0);
+    lcd.setCursor(16, 44);
+    lcd.printf("5h %s $%.0f/hr  wk %s", tokActive.c_str(), burnHr, tokWeek.c_str());
+
+    for (int i = 0; i < BARS_PER_PAGE && i < tokModelCount; i++) {
+      const TokenUsage &t = tokModels[i];
+      snprintf(footer, sizeof(footer), "%s tok   $%.2f", t.tok.c_str(), t.cost);
+      drawBar(slotY[i], t.name.c_str(), t.pct,
+              MODEL_ACCENTS[i % MODEL_ACCENT_COUNT], footer, false);
+    }
   } else {
-    snprintf(resetBuf, sizeof(resetBuf), "%dm", sessionResetMin);
-  }
-  drawBar(54, "Session (5h)", sessionPct, resetBuf);
-
-  drawBar(132, "Weekly", weeklyPct, weeklyResetDay.c_str());
-
-  if (fablePct >= 0) {
-    char fableTitle[24];
-    snprintf(fableTitle, sizeof(fableTitle), "%s (7d)",
-             fableLabel.length() ? fableLabel.c_str() : "Fable");
-    drawBar(210, fableTitle, fablePct, weeklyResetDay.c_str());
+    int first = (curPage - 1 - (hasTokenPage() ? 1 : 0)) * BARS_PER_PAGE;
+    for (int i = 0; i < BARS_PER_PAGE && first + i < modelCount; i++) {
+      const ModelUsage &m = models[first + i];
+      snprintf(label, sizeof(label), "%s (7d)", m.name.c_str());
+      snprintf(footer, sizeof(footer), "Resets: %s", m.reset.c_str());
+      drawBar(slotY[i], label, m.pct,
+              MODEL_ACCENTS[(first + i) % MODEL_ACCENT_COUNT], footer);
+    }
   }
 
   int dotY = 292;
@@ -183,6 +284,16 @@ void drawScreen() {
     lcd.printf("(%lus ago)", ago);
   } else {
     lcd.printf("(%lum ago)", ago / 60);
+  }
+
+  // Page indicator, right-aligned so it never collides with the status text
+  int pages = pageCount();
+  if (pages > 1) {
+    for (int p = 0; p < pages; p++) {
+      int px = 156 - (pages - 1 - p) * 10;
+      if (p == curPage) lcd.fillCircle(px, dotY, 3, COL_BRIGHT);
+      else              lcd.drawCircle(px, dotY, 3, COL_BAR_BG);
+    }
   }
 }
 
@@ -223,20 +334,33 @@ void pacmanTransition() {
   band.deleteSprite();
 }
 
+// Ask mDNS where the server is now. The static IP is only a fallback for APs
+// that filter multicast; when mDNS does answer, a renumbered LAN costs nothing
+// — no reflash, the next call just returns the new address.
+bool resolveServer() {
+  IPAddress found = MDNS.queryHost(SERVER_HOST, 3000);
+  bool ok = (uint32_t)found != 0;
+  serverIp = ok ? found : SERVER_FALLBACK_IP;
+  serverUrl = "http://" + serverIp.toString() + ":" + String(SERVER_PORT) + "/usage";
+  Serial.printf("[mDNS] %s.local -> %s%s\n", SERVER_HOST, serverIp.toString().c_str(),
+                ok ? "" : "  (no answer, using fallback)");
+  return ok;
+}
+
 void fetchUsage() {
   if (WiFi.status() != WL_CONNECTED) return;
 
   HTTPClient http;
-  http.begin(SERVER_URL);
+  http.begin(serverUrl);
   http.setTimeout(10000);
   int code = http.GET();
-  Serial.printf("[Fetch] GET %s -> %d\n", SERVER_URL, code);
+  Serial.printf("[Fetch] GET %s -> %d\n", serverUrl.c_str(), code);
 
   // Weak-signal SYN loss shows up as sporadic -1; one quick retry clears most
   if (code < 0) {
     http.end();
     delay(600);
-    http.begin(SERVER_URL);
+    http.begin(serverUrl);
     http.setTimeout(10000);
     code = http.GET();
     Serial.printf("[Fetch] retry -> %d\n", code);
@@ -251,17 +375,22 @@ void fetchUsage() {
     Serial.printf("[Diag] TCP gateway:80 %s (%lums)\n", gwOk ? "OK" : "FAIL", millis() - t);
     probe.stop();
     t = millis();
-    bool svOk = probe.connect(IPAddress(192, 168, 1, 100), 8266);
-    Serial.printf("[Diag] TCP 192.168.1.100:8266 %s (%lums)\n", svOk ? "OK" : "FAIL", millis() - t);
+    String server = serverIp.toString();
+    bool svOk = probe.connect(serverIp, SERVER_PORT);
+    Serial.printf("[Diag] TCP %s:%u %s (%lums)\n", server.c_str(), SERVER_PORT, svOk ? "OK" : "FAIL", millis() - t);
     probe.stop();
     t = millis();
-    bool p80 = probe.connect(IPAddress(192, 168, 1, 100), 80);
-    Serial.printf("[Diag] TCP 192.168.1.100:80 %s (%lums) <fast fail=RST=path ok>\n", p80 ? "OK" : "FAIL", millis() - t);
+    bool p80 = probe.connect(serverIp, 80);
+    Serial.printf("[Diag] TCP %s:80 %s (%lums) <fast fail=RST=path ok>\n", server.c_str(), p80 ? "OK" : "FAIL", millis() - t);
     probe.stop();
     t = millis();
     bool inet = probe.connect(IPAddress(8, 8, 8, 8), 53);
     Serial.printf("[Diag] TCP 8.8.8.8:53 %s (%lums) <internet>\n", inet ? "OK" : "FAIL", millis() - t);
     probe.stop();
+
+    // The server most likely just moved. Re-resolve so the next poll finds it
+    // at its new address instead of retrying a stale one forever.
+    resolveServer();
   }
 
   if (code == 200) {
@@ -274,10 +403,43 @@ void fetchUsage() {
       sessionPct = doc["session_pct"] | -1;
       weeklyPct = doc["weekly_pct"] | -1;
       sessionResetMin = doc["session_reset_min"] | 0;
-      fablePct = doc["fable_pct"] | -1;
-      fableLabel = doc["fable_label"].as<String>();
       weeklyResetDay = doc["weekly_reset_day"].as<String>();
       apiStatus = doc["status"].as<String>();
+
+      demoModels = doc["demo"] | false;
+      modelCount = 0;
+      for (JsonObject m : doc["models"].as<JsonArray>()) {
+        if (modelCount >= MAX_MODELS) break;
+        models[modelCount].name  = m["name"].as<String>();
+        models[modelCount].pct   = m["pct"] | 0;
+        models[modelCount].reset = m["reset_day"].as<String>();
+        modelCount++;
+      }
+
+      ccOk = doc["cc_ok"] | false;
+      tokActive = doc["tok_active"].as<String>();
+      tokWeek = doc["tok_week"].as<String>();
+      burnHr = doc["burn_hr"] | 0.0f;
+      tokModelCount = 0;
+      for (JsonObject t : doc["tok_models"].as<JsonArray>()) {
+        if (tokModelCount >= MAX_MODELS) break;
+        tokModels[tokModelCount].name = t["name"].as<String>();
+        tokModels[tokModelCount].pct  = t["pct"] | 0;
+        tokModels[tokModelCount].tok  = t["tok"].as<String>();
+        tokModels[tokModelCount].cost = t["cost"] | 0.0f;
+        tokModelCount++;
+      }
+
+      spendEnabled = doc["spend_enabled"] | false;
+      spendPct = doc["spend_pct"] | 0;
+      spendUsed = doc["spend_used"] | 0.0f;
+      spendLimit = doc["spend_limit"] | 0.0f;
+      spendCur = doc["spend_cur"].as<String>();
+
+      // A model bucket can vanish between polls — never leave the view
+      // parked on a page that no longer exists.
+      if (curPage >= pageCount()) curPage = 0;
+
       hasData = true;
       fetchError = false;
     } else {
@@ -307,6 +469,8 @@ void setup() {
   while (!Serial && millis() - t0 < 6000) delay(50);
   delay(500);
   Serial.println("Claude Usage Monitor starting...");
+
+  // serverUrl is built in resolveServer(), once WiFi is up — mDNS needs a link
 
   lcd.init();
   lcd.setRotation(0);
@@ -374,6 +538,9 @@ void setup() {
     delay(5000);
   }
 
+  MDNS.begin("claude-usage");  // also makes this board reachable as claude-usage.local
+  resolveServer();
+
   fetchUsage();
   drawScreen();
 }
@@ -387,16 +554,29 @@ void loop() {
     drawScreen();
   }
 
-  // Show loop: 30s of info, then the transition, on a fixed rhythm (VK spec)
+  // Show loop: 30s of info, then the transition, on a fixed rhythm (VK spec).
+  // The transition now also turns the page — with one page it just replays.
   if (hasData && millis() - lastAnim > 30000) {
     pacmanTransition();
+    curPage = (curPage + 1) % pageCount();
     drawScreen();
     lastAnim = millis();
   }
 
+  // Reconnect backstop. setAutoReconnect(true) already retries in the
+  // background; calling reconnect() on top of that tears down the handshake
+  // in flight and restarts it, so a dropped link never recovers — the board
+  // sits in a reason=2/36 loop indefinitely. Step in only after the system
+  // has had a fair shot, then back off. No delay() here: blocking froze the
+  // display for 5s on every pass.
   if (WiFi.status() != WL_CONNECTED) {
-    WiFi.reconnect();
-    delay(5000);
+    if (millis() - lastReconnect > reconnectBackoff) {
+      WiFi.reconnect();
+      lastReconnect = millis();
+      reconnectBackoff = min(reconnectBackoff * 2, RECONNECT_BACKOFF_MAX);
+    }
+  } else {
+    reconnectBackoff = RECONNECT_BACKOFF_MIN;
   }
 
   delay(1000);

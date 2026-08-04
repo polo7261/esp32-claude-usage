@@ -1,0 +1,7 @@
+# WiFi credentials and the LAN address of the server machine.
+# Template lives in secrets.h.example — that one IS committed.
+firmware/claude_usage/secrets.h
+
+__pycache__/
+*.pyc
+.ctxk/
