@@ -1,5 +1,9 @@
 # Claude Usage Monitor（ESP32-S3 小螢幕）
 
+> 本專案衍生自 [lminhao575-debug/esp32-claude-usage](https://github.com/lminhao575-debug/esp32-claude-usage)（MIT）。
+> 原作者提供了韌體骨架與 usage server；此分支另外加上 ccusage token 資料源、
+> 雙頁輪播、mDNS 伺服器探索、憑證外抽，以及 WiFi 重連的修正。
+
 用一片 Waveshare **ESP32-S3-LCD-1.47**（ST7789V2, 172×320）即時顯示 Claude Code 的用量：
 
 - **第 1 頁 `Usage`**：Session（5 小時窗）、Weekly（7 天）、Credits 額度花費
@@ -57,8 +61,8 @@ Mac (server.py, port 8266)  ←──區網──  ESP32 (claude_usage.ino)
 1. Mac 端啟動 server，`BIND_HOST` 設為 ESP32 連得到的那張網卡的 IP：
 
    ```bash
-   BIND_HOST=192.168.1.97 python3 server.py
-   # Serving on http://192.168.1.97:8266/usage
+   BIND_HOST=192.168.1.50 python3 server.py
+   # Serving on http://192.168.1.50:8266/usage
    ```
 
    不帶 `BIND_HOST` 只會綁 `127.0.0.1`：ESP32 連不到，但可以先用
